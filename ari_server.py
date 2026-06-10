@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
-AI 语音客服 - 全双工方案 v2 (优化TTS流畅度 + VAD抗噪)
-修复: TTS卡顿、VAD误触发、误打断
+AI 语音客服 - 全双工方案 v4 (静音保活 + 回声抑制 + 打断修复)
+修复:
+  1. TTS打断后挂断 → 静音RTP保活，防止ExternalMedia被回收
+  2. 回声误触发打断 → 动态打断阈值 + TTS冷却期
+  3. TTS卡顿 → 精确计时发包
 """
 
 import asyncio
@@ -18,6 +21,7 @@ import socket
 import numpy as np
 import requests
 import websockets
+from collections import deque
 
 # ==================== 配置 ====================
 ASTERISK_HOST = 'localhost'
@@ -38,17 +42,21 @@ TTS_SPEED = 1.0
 # 音频参数
 RTP_BASE_PORT = 25000
 
-# VAD参数 - 大幅优化
-VAD_ENERGY_THRESHOLD = 500        # 提高到500 (原来300太敏感)
-VAD_SILENCE_SEC = 1.8             # 静音1.8秒认为结束
-VAD_SPEECH_MIN_SEC = 0.5          # 最短0.5秒才算有效说话
-VAD_BARGEIN_THRESHOLD = 2000      # 打断阈值提高到2000 (原来800)
-VAD_BARGEIN_FRAMES = 5           # 连续5帧(100ms)高能量才打断，避免噪声误打断
+# VAD参数
+VAD_ENERGY_THRESHOLD = 1500        # 说话检测阈值
+VAD_SILENCE_SEC = 1.5              # 静音多久认为说话结束
+VAD_SPEECH_MIN_SEC = 0.4           # 最短有效说话时长
+
+# 打断参数
+BARGEIN_BASE_THRESHOLD = 2000      # 打断最低阈值
+BARGEIN_FRAMES = 8                 # 连续8帧(160ms)才确认打断
+ECHO_FACTOR = 0.6                  # 回声衰减因子(对方麦克风收回60%)
+ECHO_MARGIN = 1000                 # 回声估算之上的余量
+POST_TTS_COOLDOWN = 0.1            # TTS结束后100ms冷却期
 
 # RTP参数
-RTP_PACKET_SIZE = 160             # ulaw 20ms
-RTP_PACKET_INTERVAL = 0.02       # 20ms
-RTP_SEND_BUFFER = 5              # 预缓冲5包再开始发
+RTP_PACKET_SIZE = 160              # ulaw 20ms
+RTP_PACKET_INTERVAL = 0.02
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 log = logging.getLogger(__name__)
@@ -228,21 +236,43 @@ class CallSession:
         self.rtp = None
         self.rtp_port = self._alloc_port()
 
+        # VAD 状态
         self.audio_buffer_8k = []
         self.is_speaking = False
         self.silence_count = 0
         self.speech_start = None
-        self.is_ai_speaking = False
         self.processing = False
-        self.pending_speech = False   # TTS播放期间用户说话，标记待处理
         self.active = True
 
-        # 打断防抖
+        # TTS/打断 状态
+        self.is_ai_speaking = False
         self.bargein_count = 0
 
+        # ★ 回声抑制 ★
+        self.send_energy_history = deque(maxlen=500)   # 最近10秒发送能量
+        self.tts_cooldown_until = 0.0                   # TTS结束冷却时间
+
+        # ★ 静音保活 ★
+        self._silence_task = None
+
+        # 对话历史
         self.history = []
         self.welcome_playback_id = None
         self.welcome_sound_file = None
+
+    # ---- 回声估算 ----
+    def _estimate_echo(self):
+        """估算当前回声: 取最近500ms发送能量的最大值 × 回声因子"""
+        now = time.monotonic()
+        recent = [e for t, e in self.send_energy_history if now - t < 0.5]
+        if not recent:
+            return 0
+        return max(recent) * ECHO_FACTOR
+
+    def _get_bargein_threshold(self):
+        """动态打断阈值 = max(回声估算 + 余量, 基础阈值)"""
+        echo_est = self._estimate_echo()
+        return max(echo_est + ECHO_MARGIN, BARGEIN_BASE_THRESHOLD)
 
     # ---- 初始化 ----
     async def setup(self):
@@ -274,7 +304,6 @@ class CallSession:
                 return
             audio = await loop.run_in_executor(None, lambda: resp.content)
 
-            # 确保目录存在
             sound_dir = '/var/lib/asterisk/sounds/custom'
             await loop.run_in_executor(None, lambda: os.makedirs(sound_dir, exist_ok=True))
 
@@ -330,7 +359,39 @@ class CallSession:
         await ari_post(f"/ari/bridges/{self.bridge_id}/addChannel",
                        params={'channel': channel_id})
         log.info(f"[{self.channel_id[:8]}] ExternalMedia 已加入桥")
+
+        # ★ 启动静音保活 + 音频循环 ★
+        self._silence_task = asyncio.create_task(self._silence_sender())
         asyncio.create_task(self._audio_loop())
+
+    # ★★★ 静音保活发送器 ★★★
+    async def _silence_sender(self):
+        """TTS不播放时持续发送静音RTP，防止ExternalMedia被Asterisk回收"""
+        SILENCE_PKT = b'\xff' * RTP_PACKET_SIZE  # ulaw 静音
+        next_time = time.monotonic()
+
+        log.info(f"[{self.channel_id[:8]}] 🔇 静音保活发送器启动")
+
+        while self.active:
+            try:
+                # 只在TTS不播放时发送静音
+                if not self.is_ai_speaking and self.rtp and self.rtp.remote_addr:
+                    await self.rtp.send(SILENCE_PKT)
+
+                next_time += RTP_PACKET_INTERVAL
+                now = time.monotonic()
+                sleep = next_time - now
+                if sleep > 0:
+                    await asyncio.sleep(sleep)
+                elif sleep < -0.5:
+                    next_time = time.monotonic()
+
+            except Exception as e:
+                if self.active:
+                    log.debug(f"静音发送异常: {e}")
+                await asyncio.sleep(0.02)
+
+        log.info(f"[{self.channel_id[:8]}] 静音保活发送器停止")
 
     # ---- 音频处理主循环 ----
     async def _audio_loop(self):
@@ -347,26 +408,41 @@ class CallSession:
                 if len(payload) == 0:
                     continue
 
+                now = time.monotonic()
+
+                # ★ TTS冷却期: 直接丢弃所有音频 ★
+                if now < self.tts_cooldown_until:
+                    continue
+
                 pcm_8k = ulaw_to_pcm(payload)
                 energy = np.sqrt(np.mean(pcm_8k.astype(np.float64) ** 2))
 
-                # ---- 打断检测 (防抖: 连续N帧高能量才打断) ----
+                # ★★★ TTS播放中: 只检测打断，不缓冲语音 ★★★
                 if self.is_ai_speaking:
-                    if energy > VAD_BARGEIN_THRESHOLD:
+                    bargein_threshold = self._get_bargein_threshold()
+
+                    if energy > bargein_threshold:
                         self.bargein_count += 1
-                        if self.bargein_count >= VAD_BARGEIN_FRAMES:
+                        if self.bargein_count >= BARGEIN_FRAMES:
+                            echo_est = self._estimate_echo()
                             log.info(f"[{self.channel_id[:8]}] 🔔 用户打断! "
-                                     f"连续{self.bargein_count}帧高能量, last={energy:.0f}")
+                                     f"energy={energy:.0f} > 阈值{bargein_threshold:.0f} "
+                                     f"(回声~{echo_est:.0f}), "
+                                     f"连续{self.bargein_count}帧")
                             self.is_ai_speaking = False
-                            self.audio_buffer_8k.clear()
+                            # 清空VAD状态
                             self.is_speaking = False
                             self.silence_count = 0
                             self.speech_start = None
+                            self.audio_buffer_8k.clear()
                             self.bargein_count = 0
                     else:
-                        self.bargein_count = 0  # 重置防抖计数
+                        self.bargein_count = 0
 
-                # ---- VAD ----
+                    # ★ 关键: TTS期间不缓冲语音，直接continue ★
+                    continue
+
+                # ★★★ 非TTS: 正常VAD ★★★
                 is_speech = energy > VAD_ENERGY_THRESHOLD
 
                 if is_speech:
@@ -387,13 +463,11 @@ class CallSession:
                             duration = time.time() - self.speech_start
                             if duration >= VAD_SPEECH_MIN_SEC:
                                 log.info(f"[{self.channel_id[:8]}] 说话结束 ({duration:.1f}s)")
-                                if self.processing:
-                                    # 正在处理，标记待处理
-                                    self.pending_speech = True
-                                    log.info("正在处理中，标记待处理")
-                                    self.audio_buffer_8k.clear()
-                                else:
+                                if not self.processing:
                                     asyncio.create_task(self._process_speech())
+                                else:
+                                    log.info("正在处理中，忽略")
+                                    self.audio_buffer_8k.clear()
                             else:
                                 log.info(f"说话太短 ({duration:.1f}s)，忽略")
                                 self.audio_buffer_8k.clear()
@@ -442,19 +516,16 @@ class CallSession:
             if resp.status_code != 200:
                 log.error(f"STT失败: {resp.status_code}")
                 self.processing = False
-                self._check_pending()
                 return
             text = resp.json().get('text', '').strip()
         except Exception as e:
             log.error(f"STT异常: {e}")
             self.processing = False
-            self._check_pending()
             return
 
         log.info(f"🎤 识别: '{text}'")
         if not text:
             self.processing = False
-            self._check_pending()
             return
 
         reply, action, action_param = await self._llm(text)
@@ -478,54 +549,35 @@ class CallSession:
             self.history = self.history[-10:]
 
         self.processing = False
-        self._check_pending()
-
-    def _check_pending(self):
-        """检查是否有待处理的语音"""
-        if self.pending_speech and not self.is_speaking:
-            self.pending_speech = False
-            log.info(f"[{self.channel_id[:8]}] 处理待处理的语音")
-            # 不立即处理，等用户继续说完
 
     async def _llm(self, user_text):
-        system = """
-        你是「小云」，深圳车服云科技的语音客服助手，声音甜美、耐心、有礼貌。
-        你的任务是解答路边停车缴费相关的常见问题，**像和朋友聊天一样自然**。
+        system = """你是「小云」，深圳车服云科技的语音客服助手，声音甜美、耐心、有礼貌。
+你的任务是解答路边停车缴费相关的常见问题，**像和朋友聊天一样自然**。
 
-        【身份背景】
-        - 公司：深圳车服云科技，负责路边停车收费助缴。
-        - 收费：由中标公司收取，价格政府定价。
-        - 车辆受损：只收公共资源占用费，不包含保管责任，建议报警处理。
-        - 停车场不开闸：可能因为历史路边欠费未缴清，请重新扫出口码支付本次停车费。
-        - 手机号来源：是您或亲友在合作停车场缴费时主动绑定。
-        - 征信影响：目前只是欠费提醒，不影响征信。
-        - 律师函：仅作提醒，未正式起诉。
-        - 其他问题：如果不清楚，礼貌引导转人工。
+【身份背景】
+- 公司：深圳车服云科技，负责路边停车收费助缴。
+- 收费：由中标公司收取，价格政府定价。
+- 车辆受损：只收公共资源占用费，不包含保管责任，建议报警处理。
+- 停车场不开闸：可能因为历史路边欠费未缴清，请重新扫出口码支付本次停车费。
+- 手机号来源：是您或亲友在合作停车场缴费时主动绑定。
+- 征信影响：目前只是欠费提醒，不影响征信。
+- 律师函：仅作提醒，未正式起诉。
+- 其他问题：如果不清楚，礼貌引导转人工。
 
-        【回答要求】
-        1. 用口语化、有温度的方式回应，可以适当加入“嗯”、“好的”、“明白您的意思”等自然承接。
-        2. 不要机械重复规则原文，用自己的话解释，但核心信息不能错。
-        3. 回答长度可以 1~3 句，遇到复杂问题也可以稍长，但要保持简洁。
-        4. 如果用户只是想挂断，请说“好的，感谢您的来电，再见”并用动作标记结束。
-        5. 如果需要转人工，请先安抚用户，例如“我帮您转接人工客服，请稍等”。
+【回答要求】
+1. 用口语化、有温度的方式回应，可以适当加入"嗯"、"好的"、"明白您的意思"等自然承接。
+2. 不要机械重复规则原文，用自己的话解释，但核心信息不能错。
+3. 回答长度1~3句，保持简洁。
+4. 如果用户只是想挂断，请说"好的，感谢您的来电，再见"并用动作标记结束。
+5. 如果需要转人工，请先安抚用户，例如"我帮您转接人工客服，请稍等"。
 
-        【动作标记】（必须出现在回答的**最后一行，单独成行**，不要和其他文字混在一起）
-        [ACTION:hangup] - 挂断
-        [ACTION:transfer_human] - 转人工
-        [ACTION:register_plate|车牌号] - 登记车牌
-        [ACTION:sms_link] - 发送短信链接
+【动作标记】（必须出现在回答的**最后一行，单独成行**）
+[ACTION:hangup] - 挂断
+[ACTION:transfer_human] - 转人工
+[ACTION:register_plate|车牌号] - 登记车牌
+[ACTION:sms_link] - 发送短信链接
 
-        【示例对话】
-        用户：“我停车被刮了你们赔不赔？”
-        小云：“嗯，理解您的心情。我们的收费只是公共资源占用费，不包含车辆看管责任。这种情况建议您先报警处理，有需要我可以帮您转接人工客服。”
-        （没有动作标记，继续等待用户下一句话）
-
-        用户：“知道了，不用了，挂了吧。”
-        小云：“好的，感谢您的来电，祝您生活愉快，再见。”
-        [ACTION:hangup]
-
-        请你根据以上规则扮演好小云，让对话更自然。
-        """
+请你根据以上规则扮演好小云，让对话更自然。"""
 
         msgs = [{"role": "system", "content": system}] + self.history + \
                [{"role": "user", "content": user_text}]
@@ -552,9 +604,10 @@ class CallSession:
             log.error(f"LLM异常: {e}")
             return "系统出错，请稍后再试。", None, None
 
-    # ---- TTS → RTP 发送 (精确计时) ----
+    # ---- TTS → RTP 发送 (精确计时 + 能量追踪) ----
     async def _send_tts(self, text):
         self.is_ai_speaking = True
+        self.send_energy_history.clear()
         loop = asyncio.get_event_loop()
 
         try:
@@ -564,11 +617,13 @@ class CallSession:
             if resp.status_code != 200:
                 log.error(f"TTS失败: {resp.status_code}")
                 self.is_ai_speaking = False
+                self.tts_cooldown_until = time.monotonic() + POST_TTS_COOLDOWN
                 return
             audio = await loop.run_in_executor(None, lambda: resp.content)
         except Exception as e:
             log.error(f"TTS异常: {e}")
             self.is_ai_speaking = False
+            self.tts_cooldown_until = time.monotonic() + POST_TTS_COOLDOWN
             return
 
         try:
@@ -579,6 +634,7 @@ class CallSession:
         except Exception as e:
             log.error(f"WAV解析失败: {e}")
             self.is_ai_speaking = False
+            self.tts_cooldown_until = time.monotonic() + POST_TTS_COOLDOWN
             return
 
         # 转换为 8kHz 单声道 16bit
@@ -617,41 +673,57 @@ class CallSession:
             packets.append(chunk)
 
         next_send_time = time.monotonic()
-        sent_count = 0
 
         for i, pkt in enumerate(packets):
             if not self.active or not self.is_ai_speaking:
                 log.info(f"[{self.channel_id[:8]}] TTS被打断 (已发{i}/{len(packets)})")
                 break
 
+            # ★ 记录发送能量用于回声估算 ★
+            pkt_pcm = ulaw_to_pcm(pkt)
+            pkt_energy = np.sqrt(np.mean(pkt_pcm.astype(np.float64) ** 2))
+            self.send_energy_history.append((time.monotonic(), pkt_energy))
+
             await self.rtp.send(pkt)
-            sent_count += 1
             next_send_time += RTP_PACKET_INTERVAL
 
-            # 精确等待: 计算还需要等多久
             now = time.monotonic()
             sleep_time = next_send_time - now
-
             if sleep_time > 0:
                 await asyncio.sleep(sleep_time)
             elif sleep_time < -0.1:
-                # 落后太多，重置时间基准 (防止雪崩)
                 next_send_time = time.monotonic()
 
-        if sent_count == len(packets):
-            log.info(f"[{self.channel_id[:8]}] TTS播放完成")
+        # ★ TTS结束: 设置冷却期 + 清理状态 ★
+        self.tts_cooldown_until = time.monotonic() + POST_TTS_COOLDOWN
         self.is_ai_speaking = False
+
+        # 清空VAD状态，防止回声尾触发
+        self.is_speaking = False
+        self.silence_count = 0
+        self.speech_start = None
+        self.audio_buffer_8k.clear()
+        self.bargein_count = 0
+
+        log.info(f"[{self.channel_id[:8]}] TTS结束 + {POST_TTS_COOLDOWN*1000:.0f}ms冷却")
 
     # ---- DTMF ----
     async def on_dtmf(self, digit):
         log.info(f"[{self.channel_id[:8]}] DTMF: {digit}")
         if self.is_ai_speaking:
             self.is_ai_speaking = False
+            self.tts_cooldown_until = time.monotonic() + POST_TTS_COOLDOWN
 
     # ---- 清理 ----
     async def cleanup(self):
         self.active = False
         self.is_ai_speaking = False
+        if self._silence_task:
+            self._silence_task.cancel()
+            try:
+                await self._silence_task
+            except:
+                pass
         if self.rtp:
             self.rtp.close()
         if self.bridge_id:
@@ -722,10 +794,15 @@ async def run():
                             await sessions[chid].cleanup()
                             del sessions[chid]
                         else:
+                            # ExternalMedia 通道结束
                             for cid, sess in list(sessions.items()):
                                 if sess.em_channel_id == chid:
-                                    log.info(f"ExternalMedia {chid[:8]} 已结束")
+                                    log.warning(f"⚠️ ExternalMedia {chid[:8]} 异常结束!")
                                     sess.em_channel_id = None
+                                    # 尝试重建
+                                    if sess.active:
+                                        log.info(f"[{cid[:8]}] 尝试重建ExternalMedia...")
+                                        asyncio.create_task(sess._recreate_external_media())
                                     break
 
         except websockets.exceptions.ConnectionClosed:
@@ -738,13 +815,15 @@ async def run():
 
 async def main():
     log.info("=" * 60)
-    log.info("🚀 AI语音客服 - 全双工 v2 (优化流畅度)")
+    log.info("🚀 AI语音客服 - 全双工 v4 (静音保活 + 回声抑制)")
     log.info(f"   RTP端口: {RTP_BASE_PORT}+")
     log.info(f"   本机IP: {LOCAL_IP}")
-    log.info(f"   VAD阈值: {VAD_ENERGY_THRESHOLD} (提高抗噪)")
-    log.info(f"   打断阈值: {VAD_BARGEIN_THRESHOLD} (连续{VAD_BARGEIN_FRAMES}帧)")
-    log.info(f"   静音检测: {VAD_SILENCE_SEC}s")
-    log.info(f"   最小说话: {VAD_SPEECH_MIN_SEC}s")
+    log.info(f"   VAD阈值: {VAD_ENERGY_THRESHOLD}")
+    log.info(f"   打断基础阈值: {BARGEIN_BASE_THRESHOLD}")
+    log.info(f"   回声因子: {ECHO_FACTOR} (收回{ECHO_FACTOR*100:.0f}%)")
+    log.info(f"   打断确认: 连续{BARGEIN_FRAMES}帧({BARGEIN_FRAMES*20}ms)")
+    log.info(f"   TTS后冷却: {POST_TTS_COOLDOWN*1000:.0f}ms")
+    log.info(f"   静音保活: ✅ 开启")
     log.info("=" * 60)
     await run()
 
@@ -754,3 +833,4 @@ if __name__ == '__main__':
         asyncio.run(main())
     except KeyboardInterrupt:
         log.info("已停止")
+
